@@ -1,0 +1,41 @@
+# Local secrets and private application data
+.env
+.env.*
+!.env.example
+settings.json
+session-link.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.sqlite3-*
+*.log
+*.lock
+background.png
+backgrounds/
+profiles/
+User Data/
+screenshots/
+captures/
+# Python and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.spec
+*.exe
+*.lnk
+*.tmp
+# OS/editor files
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+work/
+logs/
+data/
+attachments/
