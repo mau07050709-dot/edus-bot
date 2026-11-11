@@ -1,6 +1,7 @@
 """Adaptador de reserva para pantallas que exponen evidencia suficiente."""
 
 import re
+import logging
 
 from uuid import uuid4
 
@@ -12,8 +13,8 @@ from booking import ConfirmationNotSent, DetailClickUncertain, Receipt, parse_ap
 DETAIL_TITLES = re.compile(r"^(?:Detalles? de la cita|Confirmar reserva|Confirmar cita)$", re.I)
 CONFIRM = re.compile(r"^(?:Confirmar|Reservar|Guardar) (?:la )?(?:cita|reserva)$", re.I)
 ACTION = 'button, a, [role="button"]'
-DETAIL_ICONS = ".pi-plus, .ui-icon-plus, .ui-icon-plusthick, .fa-plus, .fa-plus-circle, .fa-circle-plus"
-CONFIRM_ICONS = ".pi-check, .pi-check-circle, .ui-icon-check, .ui-icon-circle-check, .fa-check, .fa-check-circle, .fa-circle-check"
+DETAIL_ICONS = ".pi-plus, .ui-icon-plus, .ui-icon-plusthick, .fa-plus, .fa-plus-circle, .fa-circle-plus, .mdi-plus"
+CONFIRM_ICONS = ".pi-check, .pi-check-circle, .ui-icon-check, .ui-icon-circle-check, .fa-check, .fa-check-circle, .fa-circle-check, .mdi-check, .mdi-check-circle"
 EXTRA_FIELDS = (
     'input:not([type="hidden"]):visible, textarea:visible, select:visible, '
     '[contenteditable="true"]:visible, [role="textbox"]:visible, [role="combobox"]:visible'
@@ -25,11 +26,30 @@ def compact(value):
 
 
 def exact(value):
-    return re.compile(r"^\s*" + re.escape(value).replace(r"\ ", r"\s+") + r"\s*$", re.I)
+    return re.compile(r"^\s*" + re.escape(compact(value)).replace(r"\ ", r"\s+") + r"\s*$", re.I)
 
 
 def establishment_name(value):
     return re.sub(r"^\d+\s*[-–—]\s*", "", value)
+
+
+def detail_value_matches(view, label, *expected):
+    """Lee los valores de EDUS que son nodos de texto junto a su label."""
+    labels = view.locator('div.ed-input-label > label').filter(has_text=label).filter(visible=True)
+    if labels.count():
+        if labels.count() != 1:
+            return False
+        value = labels.evaluate(r"""label => {
+            const parent = label.parentElement;
+            if (parent.children.length !== 1) return null;
+            return [...parent.childNodes].filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent).join(' ').trim().replace(/\s+/g, ' ');
+        }""")
+        return value is not None and compact(value).casefold() in {compact(v).casefold() for v in expected}
+    matches = view.get_by_text(exact(expected[0]))
+    for value in expected[1:]:
+        matches = matches.or_(view.get_by_text(exact(value)))
+    return matches.filter(visible=True).count() == 1
 
 
 def detail_control(table, offer):
@@ -37,17 +57,29 @@ def detail_control(table, offer):
     if header.count() != 1 or header.and_(table.locator("thead th:nth-child(6)")).count() != 1:
         return None
     candidates = table.locator("tbody tr:visible")
-    for index, value in enumerate(offer.cells, start=1):
-        cell = table.page.locator(f"td:nth-child({index})").filter(has_text=exact(value))
-        candidates = candidates.filter(has=cell)
+    matches = candidates.evaluate_all(
+        r"""(rows, expected) => rows.flatMap((row, index) => {
+            const fields = [...row.querySelectorAll(':scope > td')].slice(0, 5)
+                .map(cell => cell.innerText.trim().replace(/\s+/g, ' '));
+            return fields.length === expected.length && fields.every((value, i) =>
+                value === expected[i].trim().replace(/\s+/g, ' ')) ? [index] : [];
+        })""", list(offer.cells),
+    )
     # Los duplicados visuales son válidos para mostrar disponibilidad, pero no para pulsar una fila.
-    if candidates.count() != 1:
+    if len(matches) != 1:
         return None
-    cell = candidates.locator("td:nth-child(6)")
+    selected = candidates.nth(matches[0]).filter(
+        has=table.page.locator("td:nth-child(3)").filter(
+            has_text=re.compile(r"(?<!\d)" + re.escape(offer.cells[2]) + r"(?!\d)")
+        )
+    )
+    cell = selected.locator("td:nth-child(6)")
     button = cell.locator(ACTION).filter(visible=True).and_(
         cell.get_by_role("button", name="Ver cita", exact=True)
         .or_(cell.get_by_role("link", name="Ver cita", exact=True))
         .or_(cell.get_by_title("Ver cita", exact=True))
+        .or_(cell.get_by_role("button", name="Asignar Cita", exact=True))
+        .or_(cell.get_by_title("Asignar Cita", exact=True))
         .or_(cell.locator(ACTION).filter(has_text=exact("+")))
         .or_(cell.locator(ACTION).filter(has=table.page.locator(f":is({DETAIL_ICONS}):visible")))
         .or_(cell.locator(f":is({ACTION}):is({DETAIL_ICONS})"))
@@ -78,14 +110,18 @@ class EdusBookingPage:
 
     def verified_detail(self, view, appointment):
         if not self.allowed(self.page.url) or view.count() != 1 or view.locator(EXTRA_FIELDS).count():
+            logging.info('Validación de reserva · vista no única, origen no válido o campos adicionales.')
             return None
         values = (appointment.number, appointment.date, appointment.time)
-        if not all(value and view.get_by_text(exact(value)).filter(visible=True).count() == 1 for value in values):
-            return None
+        value_labels = (re.compile(r'^N[.°º.º ]* de Cita:?$', re.I), exact('Fecha'), exact('Hora de Cita'))
+        for label, selector, value in zip(('número de cita', 'fecha', 'hora'), value_labels, values):
+            if not value or not detail_value_matches(view, selector, value):
+                logging.info('Validación de reserva · %s no coincide de forma única.', label)
+                return None
         # El detalle observado usa el nombre; Solicitar Cita muestra además el código.
         name = establishment_name(appointment.establishment)
-        establishment = view.get_by_text(exact(appointment.establishment)).or_(view.get_by_text(exact(name)))
-        if not name or establishment.filter(visible=True).count() != 1:
+        if not name or not detail_value_matches(view, exact('Establecimiento'), appointment.establishment, name):
+            logging.info('Validación de reserva · establecimiento no coincide de forma única.')
             return None
         same_document = self.page.evaluate("(key) => window[key] === true", self.origin_document)
         if not same_document and (
@@ -93,27 +129,33 @@ class EdusBookingPage:
             or view.get_by_text(exact(self.identification)).filter(visible=True).count() != 1
             or view.get_by_text(re.compile(r"^(?:N[.°º.º ]* )?Identificación:?$", re.I)).filter(visible=True).count() != 1
         ):
+            logging.info('Validación de reserva · documento nuevo sin identificación verificable.')
             return None
         labels = ("Fecha", "Hora de Cita", "Establecimiento")
         if not all(view.get_by_text(re.compile(rf"^{re.escape(label)}:?$", re.I)).filter(visible=True).count() == 1 for label in labels):
+            logging.info('Validación de reserva · etiquetas de fecha, hora o establecimiento no únicas.')
             return None
         if view.get_by_text(re.compile(r"^N[.°º.º ]* de Cita:?$", re.I)).filter(visible=True).count() != 1:
+            logging.info('Validación de reserva · etiqueta de número de cita no única.')
             return None
         # Si la pantalla declara el servicio o la especialidad, su valor también debe coincidir.
         for label, expected in (("Servicio", appointment.service), ("Especialidad", appointment.specialty)):
             if view.get_by_text(re.compile(rf"^{label}:?$", re.I)).filter(visible=True).count() and (
                 view.get_by_text(exact(expected)).filter(visible=True).count() != 1
             ):
+                logging.info('Validación de reserva · %s no coincide.', label)
                 return None
-        confirm = view.get_by_role("button", name=CONFIRM).filter(visible=True)
+        confirm = view.get_by_role("button", name=CONFIRM).or_(
+            view.get_by_title("Confirmar Cita", exact=True).and_(view.locator(ACTION))
+        ).filter(visible=True)
         # La pantalla de EDUS con visto bueno puede no exponer un texto accesible.
         if (
             view.get_by_text("Detalles de la Cita", exact=True).filter(visible=True).count() == 1
             and all(view.get_by_text(exact(label)).filter(visible=True).count() == 1 for label in (
                 "Consultorio", "Funcionario", "Medio de Atención", "Ubicación",
             ))
-            and all(value and view.get_by_text(exact(value)).filter(visible=True).count() == 1
-                    for value in self.offer.cells[3:])
+            and all(value and detail_value_matches(view, exact(label), value)
+                    for label, value in zip(('Consultorio', 'Funcionario'), self.offer.cells[3:]))
         ):
             check = view.locator(ACTION).filter(visible=True).and_(
                 view.locator(ACTION).filter(has_text=re.compile(r"^\s*[✓✔]\s*$"))
@@ -121,7 +163,10 @@ class EdusBookingPage:
                 .or_(view.locator(f":is({ACTION}):is({CONFIRM_ICONS})"))
             )
             confirm = confirm.or_(check)
-        return confirm if confirm.count() == 1 and confirm.is_enabled(timeout=800) else None
+        if confirm.count() == 1 and confirm.is_enabled(timeout=800):
+            return confirm
+        logging.info('Validación de reserva · control final no único o no habilitado.')
+        return None
 
     def open_details(self, appointment):
         if not appointment.number or not self.allowed(self.page.url) or self.cancelled():

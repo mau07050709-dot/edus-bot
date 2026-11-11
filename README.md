@@ -8,6 +8,7 @@ This independent source export starts with an empty account catalog. Runtime fil
 
 - Dark desktop interface, persistent custom background, account management and per-account preferences.
 - Personal Brave connection, verified account/session association and bounded connection recovery.
+- Monitoring restores the verified page after recoverable navigation or local CDP interruptions.
 - Visual security-code recognition with challenge renewal and manual intervention when needed.
 - Service and specialty selection, fresh-response validation and per-account local consultation history.
 - One-time search or continuous monitoring. After an empty result, monitoring waits two minutes, closes the verified EDUS session, reloads the login form and authenticates again.

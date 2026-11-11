@@ -4,6 +4,7 @@ import re
 from time import monotonic
 
 from playwright.sync_api import Error, TimeoutError
+from navigation_actions import navigation_click
 
 
 ADD_APPOINTMENT = "Agregar una cita"
@@ -83,7 +84,7 @@ def open_appointment_dialog(page, wait=None, guard=lambda: None):
         # La interfaz puede haber abierto el formulario mientras se validaba la sesión.
         if not dialog.count():
             try:
-                control.click(timeout=2_500)
+                navigation_click(control, timeout=2_500)
             except TimeoutError:
                 wait.progress("El clic no se pudo verificar. Comprobando el estado del formulario.")
         wait.until("Apertura de Solicitar Cita", lambda: dialog if dialog.count() == 1 else None, timeout=4)
@@ -142,10 +143,11 @@ def select_choice(dialog, label, text, before_select=lambda: None):
         raise ValueError(f"No se reconoció el menú de {label}. Selecciónalo en Brave.")
     option = dialog.page.locator(f'[id="{popup}"]').get_by_text(text, exact=True).filter(visible=True)
     if option.count() != 1:
-        combo.click(timeout=3_000)
+        trigger = combo.locator('.ui-selectonemenu-trigger:visible')
+        navigation_click(trigger if trigger.count() == 1 else combo, timeout=3_000)
     option.wait_for(state="visible", timeout=3_000)
     before_select()
-    option.click(timeout=3_000)
+    navigation_click(option, timeout=3_000)
 
 
 def read_availability(dialog):

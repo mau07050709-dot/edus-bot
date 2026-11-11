@@ -5,7 +5,7 @@ from time import monotonic
 from types import SimpleNamespace
 from urllib.parse import urlencode
 from unittest import TestCase, main
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice
@@ -332,6 +332,77 @@ class NavigationTests(TestCase):
         self.assertEqual(visits, [ORIGIN + ACCOUNT_PATH, PORTAL_URL, PORTAL_URL])
         self.assertEqual(self.page.url, PORTAL_URL)
 
+    def test_stuck_appointment_close_recovers_by_reload_then_logout(self):
+        visits = []
+        login = '''<input id="formInicioSesion:usuario"><input id="formInicioSesion:clave" type="password">
+        <input id="formInicioSesion:captchaDigitado"><button id="formInicioSesion:ejecutarPaso1">Ingresar</button>'''
+        private = '''<h1>Listado de Citas</h1><button>Agregar una cita</button>
+        <a id="formSIAC:btnMenuSalir" href="/eduscitasweb/">Salir</a>'''
+        def route(request):
+            visits.append(request.request.url)
+            html = private if request.request.url.endswith(ACCOUNT_PATH) else login
+            if len(visits) == 1:
+                html += '<section role="dialog"><h2>Solicitar Cita</h2><button>Cerrar</button></section>'
+            request.fulfill(body=html, content_type='text/html; charset=utf-8')
+        self.page.route(ORIGIN + '/**', route)
+        self.page.goto(ORIGIN + ACCOUNT_PATH)
+        verified = [ACCOUNT.key]
+        self.page.on('framenavigated', lambda frame: verified.__setitem__(0, '')
+                     if frame == self.page.main_frame else None)
+        messages = []
+        with patch('browser.close_appointment_dialog', side_effect=ValueError('Cerrar el formulario anterior')):
+            refresh_cycle_page(self.page, AUTHENTICATED, lambda: verified[0], ACCOUNT.key,
+                               lambda: False, messages.append)
+        self.assertEqual(visits, [ORIGIN + ACCOUNT_PATH, ORIGIN + ACCOUNT_PATH, PORTAL_URL, PORTAL_URL])
+        self.assertTrue(any('Formulario atascado' in message for message in messages))
+        self.assertEqual(self.page.url, PORTAL_URL)
+        self.assertEqual(verified[0], '')
+
+    def test_unverified_private_page_is_logged_out_without_trusting_identity(self):
+        visits = []
+        login = '''<input id="formInicioSesion:usuario"><input id="formInicioSesion:clave" type="password">
+        <input id="formInicioSesion:captchaDigitado"><button id="formInicioSesion:ejecutarPaso1">Ingresar</button>'''
+        private = '''<h1>Listado de Citas</h1><button>Agregar una cita</button>
+        <a id="formSIAC:btnMenuSalir" href="/eduscitasweb/">Salir</a>'''
+        def route(request):
+            visits.append(request.request.url)
+            request.fulfill(body=private if request.request.url.endswith(ACCOUNT_PATH) else login,
+                            content_type='text/html; charset=utf-8')
+        self.page.route(ORIGIN + '/**', route)
+        self.page.goto(ORIGIN + ACCOUNT_PATH)
+        worker = BrowserThread(Settings(), 'probe')
+        messages = []
+        self.assertFalse(worker.has_proof(self.page))
+        refresh_cycle_page(self.page, AUTHENTICATED, lambda: '', ACCOUNT.key, lambda: False, messages.append)
+        self.assertEqual(visits, [ORIGIN + ACCOUNT_PATH, PORTAL_URL, PORTAL_URL])
+        self.assertTrue(any('Marca de cuenta perdida' in message for message in messages))
+        self.assertFalse(worker.has_proof(self.page))
+
+    def test_expired_dialog_uses_reentry_even_with_stale_authenticated_state(self):
+        visits = []
+        login = '''<input id="formInicioSesion:usuario"><input id="formInicioSesion:clave" type="password">
+        <input id="formInicioSesion:captchaDigitado"><button id="formInicioSesion:ejecutarPaso1">Ingresar</button>'''
+        private = '''<h1>Listado de Citas</h1><button>Agregar una cita</button>
+        <section role="dialog"><h2>Sesión caducada</h2>
+        <p>La sesión ha caducado, presione el siguiente botón para volver a acceder a la aplicación</p>
+        <button onclick="location.href='/eduscitasweb/'">VOLVER A ACCEDER A LA APLICACIÓN</button></section>'''
+        def route(request):
+            visits.append(request.request.url)
+            request.fulfill(body=private if request.request.url.endswith(ACCOUNT_PATH) else login,
+                            content_type='text/html; charset=utf-8')
+        self.page.route(ORIGIN + '/**', route)
+        self.page.goto(ORIGIN + ACCOUNT_PATH)
+        messages = []
+        refresh_cycle_page(self.page, AUTHENTICATED, lambda: '', ACCOUNT.key, lambda: False, messages.append)
+        self.assertEqual(visits, [ORIGIN + ACCOUNT_PATH, PORTAL_URL])
+        self.assertTrue(any('Pulsando Volver' in message for message in messages))
+
+    def test_expired_page_without_alert_role_is_recognized(self):
+        self.page.route(ORIGIN + '/**', lambda r: r.fulfill(
+            body='<h1>La sesión ha expirado.</h1>', content_type='text/html; charset=utf-8'))
+        self.page.goto(PORTAL_URL)
+        self.assertEqual(inspect_session(self.page, False), EXPIRED)
+
     def test_automatic_login_retries_more_than_once_and_stops_on_authentication(self):
         app = QApplication.instance() or QApplication([])
         images = {}
@@ -464,6 +535,19 @@ class NavigationTests(TestCase):
 
 
 class ConnectionTests(TestCase):
+    def test_repeated_queries_never_send_when_booking_journal_is_pending(self):
+        worker = BrowserThread(Settings(), 'probe')
+        worker.journal = Mock()
+        worker.journal.state.return_value = 'pending'
+        with patch('browser.inspect_session', return_value=AUTHENTICATED), patch('browser.run_query') as query:
+            for _ in range(25):
+                outcome, _ = worker.query(Mock(), ACCOUNT, lambda: ACCOUNT.key, '000000004', object(), False)
+                self.assertEqual(outcome, 'error')
+            query.assert_not_called()
+            worker.journal.claim.assert_not_called()
+            worker.journal.state.return_value = 'confirmed'
+            self.assertEqual(worker.query(Mock(), ACCOUNT, lambda: ACCOUNT.key, '000000004', object(), False)[0], 'complete')
+
     def test_personal_cdp_uses_announced_websocket(self):
         with (
             patch("brave.personal_debug_endpoint", return_value=(9422, "/devtools/browser/test")),

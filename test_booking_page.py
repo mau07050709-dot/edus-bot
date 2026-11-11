@@ -76,10 +76,13 @@ class PortalFixtures(TestCase):
             rows = ROW.replace("12345", "98765").replace("openDetails()", "window.wrongRow = true")
             rows += ROW.replace("08:15", "02:00 P.M.").replace(
                 '<button title="Ver cita" onclick="openDetails()">Ver cita</button>',
-                '<button onclick="openDetails()"><span class="ui-icon-plus">+</span></button>',
+                '<button title="Asignar Cita" onclick="openDetails()"><span class="ui-icon mdi mdi-plus"></span>'
+                '<span style="font-size:0">Asignar Cita</span></button>',
             )
-            submit = '<span class="ui-icon-check" aria-hidden="true">✓</span>'
+            rows = rows.replace("<td>", '<td><span class="ui-column-title" style="display:none">Etiqueta</span>')
+            submit = '<span class="ui-icon mdi mdi-check-circle" aria-hidden="true"></span>'
         html = f"""
+        <style>.mdi {{ display: inline-block; width: 16px; height: 16px; }}</style>
         <section role="dialog" id="available"><h2>Solicitar Cita</h2>
         <table><thead><tr><th>Fecha</th><th>Hora de Cita</th><th>N° de Cita</th><th>Consultorio</th>
         <th>Funcionario</th><th>Ver cita</th></tr></thead><tbody>{rows}</tbody></table></section>
@@ -195,6 +198,41 @@ class PortalFixtures(TestCase):
         self.assertIsNone(self.page.evaluate("window.wrongRow"))
         self.assertEqual(self.page.evaluate("window.detailClicks"), 1)
         self.assertEqual(self.actions, 1)
+
+    def test_wrapped_clinician_matches_single_line_detail(self):
+        from dataclasses import replace
+
+        portal = self.load(ICON_DETAILS, icon=True)
+        self.page.locator('#available tbody tr').nth(1).locator('td').nth(4).evaluate(
+            "cell => cell.innerHTML = 'Julio Alonso<br>Calderon Calderon'"
+        )
+        self.page.locator('#initial p').filter(has_text='Ficticio').evaluate(
+            "node => node.textContent = 'Julio Alonso Calderon Calderon'"
+        )
+        portal.offer = next(offer for offer in read_offers(portal.table) if offer.cells[2] == APPOINTMENT.number)
+        self.assertIn('\n', portal.offer.cells[4])
+        self.assertEqual(self.reserve(portal, replace(APPOINTMENT, time='02:00 P.M.')).state, 'Reserva confirmada')
+        self.assertEqual(self.actions, 1)
+
+    def structured_detail(self, wrong_date=False):
+        import re
+        detail = re.sub(r'<p>(.*?)</p><p>(.*?)</p>',
+                        r'<div class="ed-input-label"><label>\1</label>\2\n</div>', ICON_DETAILS)
+        if wrong_date:
+            detail = detail.replace('</label>04/11/2026', '</label>05/11/2026')
+        return detail
+
+    def test_real_label_and_bare_text_detail(self):
+        from dataclasses import replace
+        portal = self.load(self.structured_detail(), icon=True)
+        self.assertEqual(self.reserve(portal, replace(APPOINTMENT, time='02:00 P.M.')).state, 'Reserva confirmada')
+        self.assertEqual(self.actions, 1)
+
+    def test_real_label_wrong_date_blocks_confirmation(self):
+        from dataclasses import replace
+        portal = self.load(self.structured_detail(wrong_date=True), icon=True)
+        self.assertEqual(self.reserve(portal, replace(APPOINTMENT, time='02:00 P.M.')).state, 'Intervención necesaria')
+        self.assertEqual(self.actions, 0)
 
     def test_ambiguous_detail_click_is_not_repeated(self):
         portal = self.load(DETAILS, ambiguous_detail=True)

@@ -1,6 +1,7 @@
 """Conexión a Brave y observación del formulario público de EDUS."""
 
 import logging
+import re
 import subprocess
 from base64 import b64decode
 from dataclasses import dataclass, replace
@@ -25,6 +26,7 @@ from booking_page import EdusBookingPage
 from captcha import read_captcha
 from query import close_appointment_dialog, current_choice, prepared_form, read_offers, run_query
 from session_link import SessionLink, load_link
+from navigation_actions import navigation_click
 from settings import save_settings
 
 
@@ -51,6 +53,8 @@ UNKNOWN = "Estado desconocido"
 AUTHENTICATED = "Autenticado"
 ACCOUNT_PATH = "/CitasWebPF/faces/xhtml/comun/Inicio.xhtml"
 CAPTCHA_RETRY_DELAY = 3
+RECOVERY_ACTION_TIMEOUT = 2_000
+RECOVERY_LOGIN_TIMEOUT = 4_000
 
 
 @dataclass(frozen=True)
@@ -127,32 +131,88 @@ def refresh_cycle_page(page, state, verified, account, cancelled, progress=lambd
     def guard():
         if cancelled():
             raise ValueError("Se detuvo la recarga.")
-        if verified() != account or not is_portal(page.url):
+        # Esta operación solo cierra una sesión. Una marca perdida tras recargar
+        # no autoriza consultas, pero tampoco debe impedir volver al ingreso.
+        if verified() not in ("", account) or not is_portal(page.url):
             raise ValueError("Cierra la sesión actual en EDUS para ingresar con la cuenta seleccionada.")
+
+    def login_arrived():
+        deadline = monotonic() + RECOVERY_LOGIN_TIMEOUT / 1000
+        while monotonic() < deadline:
+            guard()
+            if has_login_form(page):
+                return True
+            # Sondeo por tiempo real: no depende de requestAnimationFrame.
+            page.wait_for_timeout(100)
+        return False
+
+    def navigate_to_login():
+        guard()
+        progress("Recuperación de sesión · Navegando al ingreso oficial como respaldo.")
+        response = page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=15_000)
+        guard()
+        if response is None or not response.ok or not login_arrived():
+            raise ValueError("La navegación de respaldo no devolvió el formulario de ingreso de EDUS.")
+
+    def activate_and_wait(control, name):
+        guard()
+        try:
+            navigation_click(control, timeout=RECOVERY_ACTION_TIMEOUT)
+        except (Error, ValueError) as error:
+            progress(f"{name} · Activación sin confirmar ({type(error).__name__}).")
+        try:
+            arrived = login_arrived()
+        except Error:
+            arrived = False
+        if not arrived:
+            progress(f"{name} no abrió el ingreso; se descarta repetir el mismo control.")
+            navigate_to_login()
 
     if cancelled():
         raise ValueError("Se detuvo la recarga.")
     if not is_portal(page.url):
         raise ValueError("La pestaña ya no muestra el portal oficial de EDUS.")
+    if inspect_session(page, False) == EXPIRED:
+        state = EXPIRED
     if state == AUTHENTICATED:
         guard()
+        if not verified():
+            progress("Marca de cuenta perdida · Cerrando la sesión sin reutilizar su identidad.")
         dialog = appointment_dialog(page)
         if dialog.count():
             progress("Cerrando Solicitar Cita antes de salir de EDUS.")
-            close_appointment_dialog(dialog, guard, NavigationWait(page, progress, cancelled))
+            try:
+                close_appointment_dialog(dialog, guard, NavigationWait(page, progress, cancelled))
+            except (ValueError, Error):
+                guard()
+                progress("Formulario atascado · Recargando la página antes de recuperar la sesión.")
+                page.reload(wait_until="domcontentloaded", timeout=15_000)
+                guard()
+                if has_login_form(page):
+                    return
+                if inspect_session(page, False) == EXPIRED:
+                    navigate_to_login()
+                    return
         logout = page.locator(LOGOUT).filter(visible=True)
         if logout.count() != 1 or not logout.is_enabled(timeout=1_200):
-            raise ValueError("No se identificó el botón de cierre de sesión de EDUS.")
+            progress("Control de salida no disponible · Recuperando el documento de ingreso.")
+            navigate_to_login()
+            return
         guard()
-        progress("Cerrando la sesión verificada de EDUS.")
-        try:
-            logout.click(timeout=5_000)
-        except TimeoutError:
-            progress("Comprobando si EDUS cerró la sesión después del clic.")
-        page.locator(CAPTCHA).wait_for(state="visible", timeout=12_000)
-    elif state == EXPIRED and not has_login_form(page):
-        response = page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=15_000)
-        if not response or not response.ok or not is_portal(page.url) or not has_login_form(page):
+        progress("Cerrando la sesión de EDUS mediante su control oficial.")
+        activate_and_wait(logout, "Cierre de sesión")
+    elif state in (EXPIRED, UNKNOWN) and not has_login_form(page):
+        guard()
+        return_name = re.compile(r"^Volver a acceder a la aplicaci[oó]n$", re.I)
+        reentry = page.get_by_role('button', name=return_name).or_(
+            page.get_by_role('link', name=return_name)
+        ).filter(visible=True)
+        if state == EXPIRED and reentry.count() == 1 and reentry.is_enabled(timeout=800):
+            progress("Sesión caducada · Pulsando Volver a acceder a la aplicación.")
+            activate_and_wait(reentry, "Retorno desde sesión caducada")
+        else:
+            navigate_to_login()
+        if not is_portal(page.url) or not has_login_form(page):
             raise ValueError("EDUS no mostró el formulario de ingreso después de caducar la sesión.")
         return
     elif state not in (SIGNED_OUT, EXPIRED, WAITING, BAD_CAPTCHA) or not has_login_form(page):
@@ -212,10 +272,14 @@ def inspect_session(page, awaiting_code):
     if not is_portal(page.url):
         return UNKNOWN
     alerts = " ".join(page.locator(f":is({ALERTS}):visible").all_text_contents()).casefold()
-    if not (awaiting_code and has_login_form(page)) and any(message in alerts for message in (
+    expired_page = page.get_by_text(re.compile(
+        r"^(?:(?:su|la)\s+)?sesi[oó]n\s+(?:(?:ha|ya)\s+)?(?:expirad[ao]|expir[oó]|caducad[ao]|vencid[ao]|venci[oó])(?:[.!\s]|$)",
+        re.I,
+    )).filter(visible=True).count() > 0
+    if not (awaiting_code and has_login_form(page)) and (expired_page or any(message in alerts for message in (
         "sesión caducada", "sesión expirada", "sesión ha expirado", "sesión ha caducado",
         "sesión vencida", "sesión ha vencido", "sesión expiró",
-    )):
+    ))):
         return EXPIRED
     if any(message in alerts for message in (
         "credenciales incorrectas", "contraseña incorrecta", "clave incorrecta",
@@ -580,42 +644,54 @@ class BrowserThread(QThread):
             )
             if self.isInterruptionRequested():
                 return
-            tabs = [
-                page for context in browser.contexts for page in context.pages
-                if is_portal(page.url)
-            ]
-            restored = [tab for tab in tabs if self.has_proof(tab)]
-            if not restored and self.restore_session_link():
-                restored = [tab for tab in tabs if self.has_proof(tab)]
-            if len(restored) != 1:
-                self.session_proof = ("", "")
-            if len(restored) == 1:
-                tabs = restored
-            if len(tabs) > 1:
-                signed_in = [tab for tab in tabs if inspect_session(tab, False) == AUTHENTICATED]
-                if len(signed_in) != 1:
-                    raise RuntimeError("Hay varias pestañas de EDUS. Deja una sola para conectarla.")
-                tabs = signed_in
-            if tabs:
-                page = tabs[0]
-            elif len(browser.contexts) == 1:
-                page = browser.contexts[0].new_page()
-                response = page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=15_000)
-                if response is None or not response.ok or not is_portal(page.url):
-                    raise RuntimeError("EDUS no devolvió una página válida del portal oficial.")
-            else:
-                raise RuntimeError("Abre EDUS en el perfil de Brave que quieres utilizar.")
-            if self.action != "probe" and not self.isInterruptionRequested():
-                page.bring_to_front()
-            self.status.emit("Brave conectado")
-            try:
-                self.watch(page, browser)
-            except Error:
-                if browser.is_connected() and not page.is_closed():
-                    raise
-            if not self.isInterruptionRequested() and (not browser.is_connected() or page.is_closed()):
+            while not self.isInterruptionRequested() and browser.is_connected():
+                try:
+                    page = self.portal_page(browser)
+                    if self.action != "probe" and not self.isInterruptionRequested():
+                        page.bring_to_front()
+                    self.status.emit("Brave conectado")
+                    self.watch(page, browser)
+                except (Error, OSError, RuntimeError, ValueError) as error:
+                    if not browser.is_connected():
+                        raise ConnectionLost from error
+                    if self.isInterruptionRequested():
+                        break
+                    self.activity.emit(logging.WARNING,
+                        f"Recuperación de página ({type(error).__name__}) · Se conserva la conexión autorizada.")
+                    self.authentication.emit(UNKNOWN)
+                    self.status.emit("Brave conectado")
+                    # Espera interrumpible, sin crear otra sesión de depuración.
+                    for _ in range(4):
+                        if self.isInterruptionRequested():
+                            break
+                        self.msleep(250)
+            if not self.isInterruptionRequested() and not browser.is_connected():
                 raise ConnectionLost()
             # Al salir, Playwright suelta su conexión. Brave y sus pestañas quedan abiertos.
+
+    def portal_page(self, browser):
+        tabs = [page for context in browser.contexts for page in context.pages if is_portal(page.url)]
+        restored = [tab for tab in tabs if self.has_proof(tab)]
+        if not restored and self.restore_session_link():
+            restored = [tab for tab in tabs if self.has_proof(tab)]
+        if len(restored) != 1:
+            self.session_proof = ("", "")
+        if len(restored) == 1:
+            tabs = restored
+        if len(tabs) > 1:
+            signed_in = [tab for tab in tabs if inspect_session(tab, False) == AUTHENTICATED]
+            if len(signed_in) != 1:
+                raise RuntimeError("Hay varias pestañas de EDUS. Deja una sola para conectarla.")
+            tabs = signed_in
+        if tabs:
+            return tabs[0]
+        if len(browser.contexts) != 1:
+            raise RuntimeError("Abre EDUS en el perfil de Brave que quieres utilizar.")
+        page = browser.contexts[0].new_page()
+        response = page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=15_000)
+        if response is None or not response.ok or not is_portal(page.url):
+            raise RuntimeError("EDUS no devolvió una página válida del portal oficial.")
+        return page
 
     def restore_session_link(self):
         link = load_link(self.session_path)
@@ -1061,8 +1137,12 @@ class BrowserThread(QThread):
 
         try:
             guard()
-            if booking_after is not None and self.journal and self.journal.state(account.key):
-                return "error", "Existe una reserva confirmada o un envío pendiente. Verifica Listado de Citas."
+            if booking_after is not None and self.journal:
+                previous_booking = self.journal.state(account.key)
+                if previous_booking == 'confirmed':
+                    return "complete", "La reserva ya figura confirmada en el registro local."
+                if previous_booking:
+                    return "error", "Existe un envío pendiente. Se conserva el bloqueo para no duplicar la reserva. Verifica Listado de Citas."
             result = run_query(
                 page, account, guard, verify_establishment, progress,
                 preparing=preparing, cancelled=self.isInterruptionRequested, on_availability_commit=mark_commit,
@@ -1111,7 +1191,7 @@ class BrowserThread(QThread):
             return "error", "No se pudo comprobar el registro local de intentos de reserva."
         except SessionRequired as error:
             if committed:
-                return "error", "Se perdió la sesión después de iniciar la consulta. Vuelve a autenticarte; el envío no se repetirá."
+                return "retry", "La sesión caducó durante la consulta de cupos; no se envió ninguna reserva."
             return "session", str(error)
         except EstablishmentChanged as change:
             return "establishment", str(change)
@@ -1121,10 +1201,10 @@ class BrowserThread(QThread):
                 progress("Se perdió CDP antes de consultar. Se recuperará la conexión sin reenviar.")
                 raise SafeConnectionLost from error
             if not connected and committed:
-                return "error", "Se perdió CDP después de iniciar la consulta. Se omitió el reenvío."
+                return "retry", "Se perdió CDP durante la consulta de cupos; no se envió ninguna reserva."
             if isinstance(error, Error):
-                return "error", f"Navegación interrumpida ({type(error).__name__}). Revisa Brave."
-            return "error", str(error)
+                return "retry", f"Navegación interrumpida ({type(error).__name__}) antes de reservar."
+            return "retry", str(error)
 
 
 

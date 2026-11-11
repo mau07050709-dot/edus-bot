@@ -39,3 +39,9 @@ work/
 logs/
 data/
 attachments/
+GitHub_Public*/
+*.har
+*.pem
+*.key
+*.pfx
+*.p12

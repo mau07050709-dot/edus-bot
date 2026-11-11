@@ -29,6 +29,7 @@ from consultation_history import ConsultationHistory
 from monitoring import (
     MAX_DURATION, MAX_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS,
     REAL_WATCH_INTERVAL_SECONDS, WatchCycles,
+    CYCLE_STAGE_TIMEOUT_SECONDS,
 )
 from query import Result
 from settings import Settings, data_directory, load_settings, save_settings
@@ -132,6 +133,10 @@ class Consultation:
     login_requested: bool = False
     stop_requested: bool = False
     slot_found: bool = False
+    reconnect_at: float = 0
+    recoveries: int = 0
+    stage_at: float = 0
+    last_failure: str = ""
 
 
 class MainWindow(QMainWindow):
@@ -739,6 +744,9 @@ class MainWindow(QMainWindow):
             return
         previous = self.auth_status.text()
         self.auth_status.setText(state)
+        if (self.consultation and self.consultation.reload_each_cycle
+                and state in (EXPIRED, SIGNED_OUT) and state != previous):
+            self.consultation.login_requested = False
         self.update_controls()
         if state == previous:
             return
@@ -944,6 +952,7 @@ class MainWindow(QMainWindow):
         end = None if periodic else now + (MAX_DURATION if simulation else timedelta(minutes=10))
         watch = WatchCycles(interval, None if interval is not None else 1, end, monotonic())
         self.consultation = Consultation(account.key, now, watch, auto_booking, simulation, reload_each_cycle=periodic)
+        self.consultation.stage_at = monotonic()
         if interval is not None:
             environment = "simulada" if simulation else "de EDUS"
             self.record(logging.INFO, f"Vigilancia {environment} iniciada · intervalo {interval} s.")
@@ -961,10 +970,25 @@ class MainWindow(QMainWindow):
         self.advance_consultation()
 
     def advance_consultation(self):
+        try:
+            self._advance_consultation()
+        except Exception as error:
+            if self.consultation and self.consultation.reload_each_cycle and not self.closing:
+                self.retry_consultation(f"Fallo inesperado del ciclo ({type(error).__name__}).")
+            else:
+                self.end_consultation(f"Error · Fallo del ciclo ({type(error).__name__}).")
+
+    def _advance_consultation(self):
         plan = self.consultation
         if plan is None:
             return
         self.render_watch(plan)
+        tick = monotonic()
+        if (plan.reload_each_cycle and plan.phase in ("working", "refreshing", "ready")
+                and self.browser_status.text() == "Brave conectado"
+                and tick - plan.stage_at >= CYCLE_STAGE_TIMEOUT_SECONDS):
+            self.retry_consultation("El paso actual no terminó dentro de 120 s; se recuperará con la conexión autorizada.")
+            return
         if plan.phase in ("working", "refreshing"):
             return
         now = costa_rica_now()
@@ -978,7 +1002,10 @@ class MainWindow(QMainWindow):
             self.end_consultation("Error · La cuenta seleccionada cambió.")
             return
         if plan.phase == "establishment":
-            return
+            if plan.reload_each_cycle and tick >= watch.next_at:
+                plan.phase = "monitor_idle"
+            else:
+                return
         if plan.simulation:
             if watch.begin(now, tick):
                 plan.phase = "working"
@@ -989,10 +1016,19 @@ class MainWindow(QMainWindow):
         connected = self.browser is not None and self.browser_status.text() == "Brave conectado"
         if not connected:
             if self.browser is None:
+                if plan.reload_each_cycle and tick < plan.reconnect_at:
+                    self.query_state.setText("VIGILANCIA ACTIVA · Esperando para reconectar Brave…")
+                    return
                 if plan.connection_requested:
+                    if plan.reload_each_cycle:
+                        self.retry_consultation("Brave personal sigue sin conexión.")
+                        plan.connection_requested = False
+                        plan.reconnect_at = plan.watch.next_at
+                        return
                     self.end_consultation("Error · Brave personal sin conexión. Revisa brave://inspect/#remote-debugging y el aviso Permitir.")
                     return
                 plan.connection_requested = True
+                plan.stage_at = tick
                 self.start_browser("probe")
             if self.browser_status.text() == "Esperando autorización en Brave…":
                 self.query_state.setText("Pulsa Permitir si Brave solicita autorizar la conexión local.")
@@ -1002,16 +1038,21 @@ class MainWindow(QMainWindow):
         if plan.reload_each_cycle and plan.phase == "monitor_idle":
             if tick >= watch.next_at:
                 plan.phase = "refreshing"
+                plan.stage_at = tick
                 self.query_state.setText("VIGILANCIA ACTIVA · Recargando EDUS…")
                 self.browser.request_cycle_refresh(account.key)
             else:
-                self.query_state.setText("VIGILANCIA ACTIVA · Sin cupos. Esperando la siguiente recarga.")
+                self.query_state.setText("VIGILANCIA ACTIVA · Esperando el siguiente intento." if plan.last_failure else
+                                         "VIGILANCIA ACTIVA · Sin cupos. Esperando la siguiente recarga.")
             return
         state = self.auth_status.text()
         if state != AUTHENTICATED or self.verified_account != plan.account:
             if state in (SIGNED_OUT, EXPIRED) and not plan.login_requested:
                 plan.login_requested = True
                 if not self.queue_login(account):
+                    if plan.reload_each_cycle:
+                        self.retry_consultation("No se pudieron leer las credenciales guardadas.")
+                        return
                     self.end_consultation("Error · Guarda las credenciales de la cuenta.")
                     return
             messages = {
@@ -1031,6 +1072,7 @@ class MainWindow(QMainWindow):
             return
         plan.login_requested = False
         plan.phase = "working"
+        plan.stage_at = tick
         self.booking_status.setText("Preparando consulta")
         prefix = "VIGILANCIA ACTIVA" if watch.interval is not None else "Consulta única"
         self.query_state.setText(f"{prefix} · Preparando consulta…")
@@ -1064,7 +1106,7 @@ class MainWindow(QMainWindow):
             and self.auth_status.text() == AUTHENTICATED and self.verified_account == plan.account
         )
         upcoming = "—"
-        if (watch.interval is not None and plan.phase == "monitor_idle" and session_ready
+        if (watch.interval is not None and plan.phase in ("monitor_idle", "recovering", "establishment") and session_ready
                 and not plan.slot_found and not watch.stopped and (watch.end is None or next_date < watch.end)):
             upcoming = next_date.strftime("%d/%m %H:%M:%S")
         last = watch.last.strftime("%d/%m %H:%M:%S") if watch.last else "—"
@@ -1073,7 +1115,9 @@ class MainWindow(QMainWindow):
         self.watch_stats.setText(
             f"Última: {last} · Próxima: {upcoming}\n"
             f"Consultas completadas: {watch.count} · Cupos: {watch.slots}\n"
-            f"Último resultado: {result} · Actividad: {elapsed}"
+            f"Último resultado: {result} · Actividad: {elapsed}\n"
+            f"Recuperaciones programadas: {plan.recoveries}"
+            + (f"\nÚltimo fallo: {plan.last_failure}" if plan.last_failure else "")
         )
 
     @Slot(str)
@@ -1098,15 +1142,27 @@ class MainWindow(QMainWindow):
         if plan.stop_requested and outcome != "ok":
             self.end_consultation("Vigilancia detenida.")
             return
+        if outcome == "complete":
+            self.end_consultation("Reserva confirmada")
+            self.booking_result.setText(data)
+            return
+        if outcome in ("retry", "error") and plan.reload_each_cycle and not plan.stop_requested:
+            self.retry_consultation(data)
+            return
         if outcome in ("establishment", "session"):
             watch.pause()
         if outcome == "establishment":
+            if plan.reload_each_cycle:
+                self.retry_consultation("El establecimiento requiere confirmación; se volverá a comprobar.")
             plan.phase = "establishment"
             self.booking_status.setText("Intervención necesaria")
             self.query_state.setText("Intervención necesaria · Confirma el establecimiento.")
             self.notify("Confirma el establecimiento de la cuenta antes de continuar.")
             return
         if outcome == "session":
+            if plan.reload_each_cycle:
+                self.retry_consultation(data)
+                return
             plan.phase = "ready"
             plan.login_requested = False
             self.notify(data)
@@ -1138,6 +1194,7 @@ class MainWindow(QMainWindow):
             self.end_consultation("Vigilancia detenida.")
             return
         if not data.rows and watch.interval is not None:
+            plan.last_failure = ""
             now = costa_rica_now()
             self.record(logging.INFO, "Vigilancia · Sin cupos.")
             plan.phase = "monitor_idle"
@@ -1149,6 +1206,15 @@ class MainWindow(QMainWindow):
             self.render_watch(plan)
             return
         booking_state = data.booking.state if data.booking else ""
+        if plan.stop_requested and booking_state != "Reserva confirmada":
+            self.end_consultation("Vigilancia detenida.")
+            return
+        if plan.reload_each_cycle and booking_state != "Reserva confirmada":
+            reason = data.booking.message if data.booking else "Cupo detectado sin reserva confirmada."
+            if self.slot_dialog is not None:
+                self.slot_status.setText(reason)
+            self.retry_consultation(reason)
+            return
         status = booking_state if booking_state in ("Reserva confirmada", "Reserva simulada", "Error", "Intervención necesaria") and plan.auto_booking else (
             ("Cupo simulado" if plan.simulation else "Cupos disponibles") if data.rows else "Sin cupos"
         )
@@ -1168,14 +1234,42 @@ class MainWindow(QMainWindow):
         if plan is None or plan.phase != "refreshing":
             return
         if error:
+            if plan.reload_each_cycle and not plan.stop_requested:
+                self.retry_consultation(error)
+                return
             self.end_consultation("Intervención necesaria · " + error)
             return
         plan.phase = "ready"
+        plan.stage_at = monotonic()
         plan.login_requested = False
         self.verified_account = ""
         self.auth_status.setText(SIGNED_OUT)
         self.update_controls()
         self.advance_consultation()
+
+    def retry_consultation(self, reason):
+        plan = self.consultation
+        if plan is None or not plan.reload_each_cycle or plan.stop_requested:
+            return
+        plan.slot_found = False
+        plan.watch.stopped = False
+        plan.watch.pause()
+        plan.watch.next_at = monotonic() + REAL_WATCH_INTERVAL_SECONDS
+        plan.phase = "monitor_idle"
+        plan.login_requested = False
+        plan.recoveries += 1
+        plan.last_failure = reason
+        plan.stage_at = monotonic()
+        # Una demora del portal no cierra el websocket autorizado. La cola del
+        # mismo trabajador serializa la próxima recarga tras la operación actual.
+        plan.connection_requested = False
+        plan.reconnect_at = plan.watch.next_at
+        self.record(logging.WARNING, f"Vigilancia · Recuperación {plan.recoveries}: {reason}")
+        self.record(logging.INFO, "La vigilancia continúa. Nueva recuperación en 120 s; sin repetir reservas.")
+        self.query_state.setText("VIGILANCIA ACTIVA · Recuperando la consulta. Próxima recarga en 120 s.")
+        if self.slot_dialog is not None:
+            self.slot_status.setText(reason + "\nLa vigilancia sigue activa; próximo intento en 120 s.")
+        self.render_watch(plan)
 
     def notify(self, message):
         if QSystemTrayIcon.isSystemTrayAvailable() and QSystemTrayIcon.supportsMessages():
@@ -1232,12 +1326,18 @@ class MainWindow(QMainWindow):
         self.auth_status.setText(UNKNOWN)
         self.update_availability(None)
         if self.consultation and not self.consultation.simulation and self.consultation.phase in (
-            "working", "refreshing", "establishment", "monitor_idle",
+            "ready", "working", "refreshing", "establishment", "monitor_idle",
         ):
-            self.end_consultation(
-                "Vigilancia detenida." if self.consultation.stop_requested else
-                "Error · Se interrumpió la conexión con Brave."
-            )
+            plan = self.consultation
+            if plan.reload_each_cycle and not plan.stop_requested and not self.closing:
+                self.retry_consultation("Se interrumpió la conexión con Brave.")
+                plan.connection_requested = False
+                plan.reconnect_at = plan.watch.next_at
+            else:
+                self.end_consultation(
+                    "Vigilancia detenida." if plan.stop_requested else
+                    "Error · Se interrumpió la conexión con Brave."
+                )
         if self.closing:
             self.close()
         else:

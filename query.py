@@ -11,6 +11,7 @@ from playwright.sync_api import Error, TimeoutError
 from activity import costa_rica_now
 from booking import Offer, Outcome, unique_offers
 from booking_page import ACTION, DETAIL_ICONS
+from navigation_actions import navigation_click
 from appointments import (
     CHOICES, NO_SLOTS, NavigationWait, appointment_close, appointment_dialog, appointment_table,
     assigned_establishment, choices, open_appointment_dialog,
@@ -148,7 +149,7 @@ def close_appointment_dialog(dialog, guard, wait):
     )
     guard()
     try:
-        close.click(timeout=2_500)
+        navigation_click(close, timeout=2_500)
     except TimeoutError:
         wait.progress("Comprobando si el formulario se cerró después del clic.")
     wait.until("Cerrar el formulario anterior", lambda: dialog.count() == 0)
@@ -294,7 +295,7 @@ def read_offers(table):
                 .filter(control => control.getClientRects().length && !control.disabled
                     && control.getAttribute('aria-disabled') !== 'true'
                     && ([control.textContent, control.title, control.getAttribute('aria-label')]
-                        .some(label => label?.trim().toLowerCase() === 'ver cita')
+                        .some(label => ['ver cita', 'asignar cita'].includes(label?.trim().toLowerCase()))
                         || control.textContent.trim() === '+'
                         || control.matches(icons)
                         || Array.from(control.querySelectorAll(icons)).some(icon => icon.getClientRects().length)));
